@@ -538,13 +538,18 @@ async def stream_from_non_stream(request_data: dict[str, Any], headers: dict[str
         yield f"event: content_block_stop\ndata: {json.dumps(block_stop, ensure_ascii=False)}\n\n"
     
     # 發送 message_delta
+    # 確保 usage 有完整的欄位，避免 undefined 錯誤
+    api_usage = result.get("usage", {})
     message_delta = {
         "type": "message_delta",
         "delta": {
             "stop_reason": result.get("stop_reason", "end_turn"),
             "stop_sequence": result.get("stop_sequence")
         },
-        "usage": result.get("usage", {})
+        "usage": {
+            "input_tokens": api_usage.get("input_tokens", 0),
+            "output_tokens": api_usage.get("output_tokens", 0)
+        }
     }
     yield f"event: message_delta\ndata: {json.dumps(message_delta, ensure_ascii=False)}\n\n"
     
