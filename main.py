@@ -9,8 +9,11 @@ Claude Code → 本 Proxy (轉繁體) → MiniMax API
 
 import json
 import os
+import ssl
+import socket
 import logging
 from contextlib import asynccontextmanager
+from urllib.parse import urlparse
 from typing import Any
 
 import httpx
@@ -47,6 +50,124 @@ MAX_REQUEST_SIZE = 10 * 1024 * 1024
 
 # 共享的 HTTP client (連線池重用)
 http_client: httpx.AsyncClient | None = None
+
+# 備用 IP 列表（手動維護，當 DNS 回傳的 IP 全掛時使用）
+FALLBACK_IPS = ["47.252.72.253", "47.89.128.168"]
+
+# 快取上次成功連線的 IP（跨請求共享，加速連線）
+_last_good_ip: str | None = None
+
+
+
+async def resolve_host_ips(host: str, port: int = 443) -> list[str]:
+    """解析 host 的所有 A record IP"""
+    import asyncio
+    loop = asyncio.get_event_loop()
+    try:
+        infos = await loop.run_in_executor(
+            None,
+            lambda: socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
+        )
+        # 去重保順序
+        seen: set[str] = set()
+        ips: list[str] = []
+        for info in infos:
+            ip = info[4][0]
+            if ip not in seen:
+                seen.add(ip)
+                ips.append(ip)
+        return ips
+    except Exception as e:
+        logger.warning(f"DNS resolve failed for {host}: {e}")
+        return []
+
+
+async def tcp_probe(ip: str, port: int = 443, timeout: float = 3.0) -> bool:
+    """快速測試 TCP 連線是否可達（不做 TLS，只測 TCP）"""
+    import asyncio
+    try:
+        conn = asyncio.open_connection(ip, port)
+        reader, writer = await asyncio.wait_for(conn, timeout=timeout)
+        writer.close()
+        await writer.wait_closed()
+        return True
+    except Exception:
+        return False
+
+
+async def call_api_with_fallback(
+    url: str,
+    headers: dict[str, str],
+    json_data: dict[str, Any]
+) -> httpx.Response:
+    """
+    帶 IP fallback 的 POST 請求。
+    策略：
+    1. 先用快速 TCP probe（3秒）測試哪個 IP 可達
+    2. 用 monkey-patch socket.getaddrinfo 讓 httpx 連到指定 IP
+       （保持 URL hostname 不變，TLS SNI/憑證驗證都能正確對上）
+    3. 快取成功的 IP 加速後續請求
+    """
+    import asyncio
+    global _last_good_ip, http_client
+    assert http_client is not None
+
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+
+    # 建立嘗試順序（快取優先，DNS 其次，硬編碼備用最後）
+    ips_to_try: list[str] = []
+    if _last_good_ip:
+        ips_to_try.append(_last_good_ip)
+
+    dns_ips = await resolve_host_ips(host)
+    for ip in dns_ips:
+        if ip not in ips_to_try:
+            ips_to_try.append(ip)
+
+    for ip in FALLBACK_IPS:
+        if ip not in ips_to_try:
+            ips_to_try.append(ip)
+
+    # 快速 TCP probe：找到第一個可達的 IP
+    good_ip: str | None = None
+    for ip in ips_to_try:
+        if await tcp_probe(ip, port, timeout=3.0):
+            good_ip = ip
+            logger.info(f"TCP probe OK: {ip}:{port}")
+            break
+        else:
+            logger.warning(f"TCP probe FAIL: {ip}:{port}")
+
+    if good_ip is None:
+        # 全部不可達，不做 fallback，讓正常流程處理（會 timeout，外層 retry 處理）
+        logger.warning("All IPs failed TCP probe, using default route")
+        return await http_client.post(url, headers=headers, json=json_data)
+
+    # Monkey-patch socket.getaddrinfo 讓 httpx 連到指定 IP
+    # 這樣 URL 保持用 hostname，TLS SNI 和憑證驗證都對 hostname，不對 IP
+    original_getaddrinfo = socket.getaddrinfo
+
+    def patched_getaddrinfo(h, p, *args, **kwargs):
+        if h == host:
+            return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", (good_ip, p or port))]
+        return original_getaddrinfo(h, p, *args, **kwargs)
+
+    try:
+        socket.getaddrinfo = patched_getaddrinfo  # type: ignore
+        logger.info(f"Calling MiniMax (forced IP: {good_ip})")
+        resp = await http_client.post(url, headers=headers, json=json_data)
+        _last_good_ip = good_ip
+        logger.info(f"Success via IP: {good_ip} (status {resp.status_code})")
+        return resp
+    except (httpx.ConnectTimeout, httpx.ConnectError) as e:
+        _last_good_ip = None
+        logger.warning(f"Failed with forced IP={good_ip}: {type(e).__name__}")
+        raise
+    finally:
+        socket.getaddrinfo = original_getaddrinfo  # 務必恢復，避免影響其他連線
+
 
 
 @asynccontextmanager
@@ -254,10 +375,10 @@ async def proxy_messages(request: Request):
             )
         else:
             # 非串流請求
-            response = await http_client.post(
+            response = await call_api_with_fallback(
                 f"{MINIMAX_BASE_URL}/v1/messages",
                 headers=headers,
-                json=request_data
+                json_data=request_data
             )
             
             if response.status_code != 200:
@@ -332,10 +453,10 @@ async def stream_from_non_stream(request_data: dict[str, Any], headers: dict[str
                 else:
                     logger.info(f"Retry attempt #{attempt + 1} after connection failure")
                 
-                response = await http_client.post(
+                response = await call_api_with_fallback(
                     f"{MINIMAX_BASE_URL}/v1/messages",
                     headers=headers,
-                    json=request_data
+                    json_data=request_data
                 )
                 api_duration = time.time() - start_time
                 logger.info(f"MiniMax API call completed in {api_duration:.2f}s, status: {response.status_code}")
@@ -425,7 +546,7 @@ async def stream_from_non_stream(request_data: dict[str, Any], headers: dict[str
         
         # 發送結束事件
         yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0}, ensure_ascii=False)}\n\n"
-        yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'error'}}, ensure_ascii=False)}\n\n"
+        yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'error'}, 'usage': {'input_tokens': 0, 'output_tokens': 0}}, ensure_ascii=False)}\n\n"
         yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'}, ensure_ascii=False)}\n\n"
         return
     
@@ -748,10 +869,10 @@ async def _handle_openai_chat_completions(request: Request, endpoint_name: str =
             )
         else:
             # 非串流模式
-            response = await http_client.post(
+            response = await call_api_with_fallback(
                 f"{MINIMAX_BASE_URL}/v1/messages",
                 headers=headers,
-                json=anthropic_request
+                json_data=anthropic_request
             )
             
             if response.status_code != 200:
