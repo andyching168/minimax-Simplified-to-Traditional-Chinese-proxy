@@ -37,6 +37,10 @@ logger = logging.getLogger(__name__)
 # MiniMax API 設定
 MINIMAX_BASE_URL = os.getenv("MINIMAX_BASE_URL", "https://api.minimax.io/anthropic")
 
+# 預設模型參數（MiniMax Anthropic API 支援 temperature 和 top_p）
+DEFAULT_TEMPERATURE = float(os.getenv("DEFAULT_TEMPERATURE", "0.6"))
+DEFAULT_TOP_P = float(os.getenv("DEFAULT_TOP_P", "0.95"))  # MiniMax 預設值
+
 # 設定細分的 timeout - 針對長請求優化
 TIMEOUT = httpx.Timeout(
     connect=10.0,      # 建立連線 10 秒
@@ -315,6 +319,28 @@ def get_forwarding_headers(request: Request) -> dict[str, str]:
     return headers
 
 
+def apply_default_parameters(request_data: dict[str, Any]) -> dict[str, Any]:
+    """
+    應用預設參數到請求中
+    如果請求中沒有設定 temperature 或 top_p，則使用預設值
+    
+    注意：MiniMax Anthropic API 只支援 temperature 和 top_p
+    不支援 frequency_penalty 和 presence_penalty
+    """
+    data = request_data.copy()
+    
+    # 只在沒有設定時才使用預設值
+    if "temperature" not in data:
+        data["temperature"] = DEFAULT_TEMPERATURE
+        logger.info(f"Applied default temperature: {DEFAULT_TEMPERATURE}")
+    
+    if "top_p" not in data:
+        data["top_p"] = DEFAULT_TOP_P
+        logger.info(f"Applied default top_p: {DEFAULT_TOP_P}")
+    
+    return data
+
+
 @app.get("/")
 async def root():
     """根路徑"""
@@ -363,6 +389,8 @@ async def proxy_messages(request: Request):
             # 然後在 proxy 端轉換成串流格式
             request_data_non_stream = request_data.copy()
             request_data_non_stream["stream"] = False
+            # 應用預設參數
+            request_data_non_stream = apply_default_parameters(request_data_non_stream)
             
             return StreamingResponse(
                 stream_from_non_stream(request_data_non_stream, headers),
@@ -374,7 +402,8 @@ async def proxy_messages(request: Request):
                 }
             )
         else:
-            # 非串流請求
+            # 非串流請求 - 應用預設參數
+            request_data = apply_default_parameters(request_data)
             response = await call_api_with_fallback(
                 f"{MINIMAX_BASE_URL}/v1/messages",
                 headers=headers,

@@ -12,6 +12,12 @@ from typing import Any
 class TraditionalChineseConverter:
     """簡體中文轉繁體中文的轉換器"""
     
+    # 需要保護的繁體詞彙（避免被 OpenCC 重複轉換）
+    # 例如：OpenCC 會把「算法」→「演算法」，但也會把「演算法」→「演演算法」
+    PROTECTED_TERMS = [
+        '演算法',  # 算法 → 演算法，但已經是演算法時不應再轉換
+    ]
+    
     def __init__(self, config: str = "s2twp"):
         """
         初始化轉換器
@@ -37,7 +43,27 @@ class TraditionalChineseConverter:
         """
         if not text:
             return text
-        return self.converter.convert(text)
+        
+        # 先保護已經正確的繁體詞彙，避免被重複轉換
+        protected: list[tuple[str, str]] = []
+        
+        def protect_term(match: re.Match) -> str:
+            placeholder = f"__PROTECTED_TERM_{len(protected)}__"
+            protected.append((placeholder, match.group(0)))
+            return placeholder
+        
+        # 保護所有需要保護的詞彙
+        for term in self.PROTECTED_TERMS:
+            text = re.sub(re.escape(term), protect_term, text)
+        
+        # 進行簡繁轉換
+        text = self.converter.convert(text)
+        
+        # 還原被保護的詞彙
+        for placeholder, original in protected:
+            text = text.replace(placeholder, original)
+        
+        return text
     
     def convert_preserve_code(self, text: str) -> str:
         """
